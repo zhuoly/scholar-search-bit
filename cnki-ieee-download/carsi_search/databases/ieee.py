@@ -4,7 +4,6 @@ IEEE Xplore database adapter.
 
 import asyncio
 from urllib.parse import quote
-from playwright.async_api import Page
 from .base import BaseAdapter
 
 

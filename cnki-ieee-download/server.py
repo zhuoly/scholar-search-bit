@@ -20,7 +20,6 @@ MCP tools:
 添加新数据库: 编辑 registry.py + 在 databases/ 下创建适配器
 """
 
-import json
 import asyncio
 import os
 import sys
@@ -271,7 +270,9 @@ async def handle_login(args: dict) -> list[TextContent]:
             return [TextContent(type="text", text=str(e))]
 
     ctx = _auth.context
+    assert ctx is not None
     db_config = get_db(database)
+    assert db_config is not None
     db_label = db_config["label"]
     home_url = db_config["home_url"]
     target_domain = home_url.split("/")[2]
@@ -344,6 +345,7 @@ async def _try_cookie_session(db: str) -> bool:
         return False
 
     ctx = auth.context
+    assert ctx is not None
     from carsi_search.registry import get_db as _get_db
     db_config = _get_db(db)
     if not db_config:
@@ -444,8 +446,9 @@ async def handle_search(args: dict) -> list[TextContent]:
         text += "\n"
     text += "-> Use detail(url=URL) for full metadata"
     # 搜索成功后保存 cookie，确保会话持久化
-    try: await _auth.save_state()
-    except: pass
+    if _auth:
+        try: await _auth.save_state()
+        except: pass
     return [TextContent(type="text", text=text)]
 
 
@@ -495,8 +498,9 @@ async def handle_detail(args: dict) -> list[TextContent]:
     if result.get("citation"): text += f"\n**Citation**\n{result['citation']}\n"
 
     # 详情获取成功后保存 cookie
-    try: await _auth.save_state()
-    except: pass
+    if _auth:
+        try: await _auth.save_state()
+        except: pass
     return [TextContent(type="text", text=text or "No details extracted.")]
 
 
@@ -587,7 +591,6 @@ async def handle_download(args: dict) -> list[TextContent]:
         await asyncio.sleep(2)
 
         # 从当前 PDF 页面 fetch
-        current_url = page.url
         pdf_b64 = await page.evaluate("""
             async () => {{
                 try {{
@@ -647,8 +650,9 @@ async def handle_download(args: dict) -> list[TextContent]:
         save_path = downloads_dir / filename
         save_path.write_bytes(pdf_data)
         # 下载成功后保存 cookie
-        try: await _auth.save_state()
-        except: pass
+        if _auth:
+            try: await _auth.save_state()
+            except: pass
         return [TextContent(type="text",
             text=f"Downloaded PDF ({len(pdf_data)} bytes)\nSaved: {save_path}")]
     else:
@@ -659,13 +663,14 @@ async def handle_download(args: dict) -> list[TextContent]:
             text=f"Could not auto-download ({pdf_b64[:80]}). Opened in browser.\nURL: {page.url[:200]}")]
 
 
-async def handle_status(args: dict) -> list[TextContent]:
+async def handle_status(_args: dict) -> list[TextContent]:
     """显示当前会话状态：已注册的数据库列表、已登录的数据库、CDP 连接状态。"""
     global _auth, _pages
 
     lines = [f"**Registered databases**: {DB_LIST}"]
     for name in list_dbs():
         db = get_db(name)
+        assert db is not None
         logged_in = name in _pages
         marker = " < logged in" if logged_in else ""
         lines.append(f"  - `{name}`: {db['label']}{marker}")
@@ -681,7 +686,7 @@ async def handle_status(args: dict) -> list[TextContent]:
     return [TextContent(type="text", text="\n".join(lines))]
 
 
-async def handle_logout(args: dict) -> list[TextContent]:
+async def handle_logout(_args: dict) -> list[TextContent]:
     """断开 CDP 连接，重置全局状态。不会关闭用户的真实 Chrome 浏览器。"""
     global _auth, _pages
 
@@ -703,7 +708,7 @@ async def handle_logout(args: dict) -> list[TextContent]:
 # ══════════════════════════════════════════════════════════════════════
 
 
-async def handle_cnki_login(args: dict) -> list[TextContent]:
+async def handle_cnki_login(_args: dict) -> list[TextContent]:
     """
     CNKI 登录 —— no-op（空操作）。
 
@@ -729,6 +734,7 @@ async def handle_cnki_search(args: dict) -> list[TextContent]:
         except RuntimeError as e:
             return [TextContent(type="text", text=str(e))]
     ctx = _auth.context
+    assert ctx is not None
     # 优先使用已缓存的 CNKI 页面
     page = _pages.get("cnki")
     if page:
@@ -795,6 +801,7 @@ async def handle_cnki_detail(args: dict) -> list[TextContent]:
         except RuntimeError as e:
             return [TextContent(type="text", text=str(e))]
     ctx = _auth.context
+    assert ctx is not None
     # 优先使用已缓存的 CNKI 页面
     page = _pages.get("cnki")
     if page:
@@ -860,6 +867,7 @@ async def handle_cnki_download(args: dict) -> list[TextContent]:
         except RuntimeError as e:
             return [TextContent(type="text", text=str(e))]
     ctx = _auth.context
+    assert ctx is not None
     # 优先使用已缓存的 CNKI 页面
     page = _pages.get("cnki")
     if page:
@@ -920,19 +928,35 @@ async def handle_cnki_download(args: dict) -> list[TextContent]:
         save_dir.mkdir(exist_ok=True)
         save_path = save_dir / fname
 
-        # 优先用 dl.path() 获取临时文件，直接 copy（比 save_as 更可靠）
-        tmp = await dl.path()
-        if tmp and Path(tmp).exists() and Path(tmp).stat().st_size > 0:
-            shutil.copy2(str(tmp), str(save_path))
-        else:
-            # fallback: save_as
-            await dl.save_as(str(save_path))
+        # dl.path() 会等下载完成，但 CNKI 的下载可能写入延迟
+        # 先用 save_as（内部会等下载完成），更可靠
+        await dl.save_as(str(save_path))
+
+        # 如果 save_as 产出空文件，回退到 dl.path() + 等待文件写入
+        if save_path.stat().st_size == 0:
+            tmp = await dl.path()
+            if tmp and Path(tmp).exists():
+                # 等待文件写入完成（最多 30s）
+                for _ in range(30):
+                    size1 = Path(tmp).stat().st_size
+                    await asyncio.sleep(1)
+                    size2 = Path(tmp).stat().st_size
+                    if size1 == size2 and size2 > 0:
+                        break
+                shutil.copy2(str(tmp), str(save_path))
 
         # 验证
         file_size = save_path.stat().st_size
         if file_size == 0:
+            # 调试：检查下载失败原因
+            failure = await dl.failure()
+            tmp = await dl.path()
+            tmp_size = Path(tmp).stat().st_size if tmp and Path(tmp) else -1
             return [TextContent(type="text",
-                text="NEED_LOGIN: CNKI 下载失败（文件为空）。请告诉用户在 Chrome 浏览器中重新登录 CNKI，登录完成后告知你，然后重试。")]
+                text=f"NEED_LOGIN: CNKI 下载失败（文件为空）。\n"
+                     f"调试: url={dl.url[:100]}, file={fname}, "
+                     f"failure={failure}, tmp={tmp}, tmp_size={tmp_size}\n"
+                     f"请告诉用户在 Chrome 浏览器中重新登录 CNKI，登录完成后告知你，然后重试。")]
 
         with open(save_path, 'rb') as f:
             header = f.read(4)

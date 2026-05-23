@@ -100,6 +100,7 @@ class CarsiAuth:
                         f"请手动启动 Chrome: chrome --remote-debugging-port=9222"
                     )
 
+        assert self.browser is not None
         self.context = self.browser.contexts[0] if self.browser.contexts else await self.browser.new_context()
         log.info(f"[CDP] 已连接 Chrome: {CDP_URL}")
 
@@ -165,6 +166,7 @@ class CarsiAuth:
             return
 
         injected = 0
+        assert self.context is not None
         for cookie in cookies:
             try:
                 cdp_cookie = {
@@ -181,7 +183,7 @@ class CarsiAuth:
                     cdp_cookie["sameSite"] = cookie["sameSite"]
                 if cookie.get("expires", -1) > 0:
                     cdp_cookie["expires"] = cookie["expires"]
-                await self.context.add_cookies([cdp_cookie])
+                await self.context.add_cookies([cdp_cookie])  # type: ignore[arg-type]
                 injected += 1
             except Exception:
                 pass

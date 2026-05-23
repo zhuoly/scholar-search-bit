@@ -4,7 +4,6 @@ ScienceDirect (Elsevier) database adapter.
 
 import asyncio
 from urllib.parse import quote
-from playwright.async_api import Page
 from .base import BaseAdapter
 
 
@@ -25,16 +24,11 @@ class ScienceDirectAdapter(BaseAdapter):
         if captcha_result:
             return captcha_result
 
-        # 等搜索结果加载（标题链接 + PDF 链接）
+        # 等搜索结果加载（标题链接）
         try:
             await self.page.wait_for_selector(
-                'a[href*="/science/article/pii/"]', timeout=15000
+                'a[href*="/science/article/pii/"]', timeout=20000
             )
-            # 明确等 PDF 链接加载
-            try:
-                await self.page.wait_for_selector('a.download-link', timeout=10000)
-            except Exception:
-                pass
             await asyncio.sleep(1)
         except Exception:
             # 可能验证码又出现了
@@ -230,5 +224,3 @@ class ScienceDirectAdapter(BaseAdapter):
         if await self._check_bot_challenge():
             return {"success": False, "error": "captcha"}
         return None
-
-        return {"success": False, "error": "captcha"}

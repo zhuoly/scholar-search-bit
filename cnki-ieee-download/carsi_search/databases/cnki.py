@@ -52,7 +52,6 @@ CNKI 的反爬系统会检测 Playwright 浏览器（无论 headless 还是有�
 """
 
 import asyncio
-import urllib.parse
 from .base import BaseAdapter
 
 

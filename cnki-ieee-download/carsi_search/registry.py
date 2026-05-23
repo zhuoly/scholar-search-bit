@@ -2,9 +2,6 @@
 Database adapter registry — add new databases here.
 """
 
-import asyncio
-from pathlib import Path
-
 DB_REGISTRY = {
 
     "ieee": {
