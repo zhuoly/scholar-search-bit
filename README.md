@@ -109,6 +109,12 @@ scholar-search/
 | Playwright + mcp | 是 | MCP 服务器运行时 |
 | 机构账号 | 下载需要 | IEEE/ScienceDirect CARSI 认证；CNKI 机构登录 |
 
+## 免责声明
+
+- 本项目仅在**西安电子科技大学**账号下测试通过，其他学校的 CARSI 认证流程、域名、IdP 配置可能不同，需要对 `carsi_search/registry.py` 中的 `sp_url`、`home_url`、`target_url_pattern` 等字段进行修改。
+- 本项目仅供学术研究使用，请遵守各数据库的使用条款。
+- Cookie 文件（`.carsi_state.json`）包含登录凭证，请勿提交到公开仓库。
+
 ## 致谢
 
 - [cnki-skills](https://github.com/cookjohn/cnki-skills) — CNKI 知网 Skills
