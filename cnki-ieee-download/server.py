@@ -1,31 +1,27 @@
 #!/usr/bin/env python3
 """
-学术论文搜索下载 MCP Server — IEEE / CNKI 统一入口。
+学术论文搜索下载 MCP Server — IEEE / ScienceDirect / CNKI 统一入口。
 
-所有数据库通过 CDP 连接用户真实 Chrome，自动启动 Chrome（如未运行）。
-用户手动登录一次，cookie 自动保存恢复，无需自动化表单填写。
+通过 CDP 连接用户真实 Chrome/Edge，自动启动浏览器（如未运行）。
+用户手动登录一次，cookie 自动保存恢复。
 
-MCP tools:
-  login         - 连接 Chrome 并检测数据库登录状态
-  search        - 搜索论文 (IEEE)
-  detail        - 获取论文详情
-  download      - 下载 PDF (IEEE: JS fetch)
-  status        - CDP 连接状态 + 数据库列表
-  logout        - 断开 CDP（不关闭 Chrome）
-  cnki_search   - 搜索 CNKI
-  cnki_login    - CNKI 登录检测 (no-op，使用 Chrome 已有登录态)
-  cnki_detail   - CNKI 论文详情
-  cnki_download - CNKI PDF/CAJ 下载
+MCP tools (格式: {数据库}_{操作}):
+  ieee_login / ieee_search / ieee_detail / ieee_download
+  sciencedirect_login / sciencedirect_search / sciencedirect_detail / sciencedirect_download
+  cnki_login / cnki_search / cnki_detail / cnki_download
+  status / logout
 
 添加新数据库: 编辑 registry.py + 在 databases/ 下创建适配器
 """
 
 import asyncio
+import base64
 import os
+import re
 import sys
+import time
 from pathlib import Path
 
-# Ensure project root is in Python path (MCP server may run from any CWD)
 sys.path.insert(0, str(Path(__file__).parent))
 
 from mcp.server import Server
@@ -34,27 +30,292 @@ from mcp.types import Tool, TextContent
 
 from carsi_search.engine import CarsiAuth, log
 from carsi_search.registry import list_dbs, get_db, get_adapter
+from carsi_search.databases.cnki import CnkiAdapter
 
-# ── MCP Server 实例 ──────────────────────────────────────────────────
+from playwright.async_api import Page as PwPage
+
 app = Server("cnki-ieee-download")
 
-# ── 全局状态 ─────────────────────────────────────────────────────────
-_auth = None        # CarsiAuth 实例，管理 CDP 连接
-_pages = {}         # 按数据库名存储各自的 Page: {"ieee": page, "sciencedirect": page, "cnki": page}
-
-# 从 registry 获取所有已注册数据库的名称列表，用于 tool 描述
+_auth: CarsiAuth | None = None
+_pages: dict = {}
 DB_LIST = ", ".join(list_dbs())
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Tool 定义
+# Helper Functions
+# ══════════════════════════════════════════════════════════════════════
+
+async def _ensure_connection() -> str | None:
+    """Ensure CDP connection exists. Returns error message or None."""
+    global _auth, _pages
+    if _auth and _auth.context:
+        # Verify the connection is actually alive by probing it
+        try:
+            _ = _auth.context.pages
+            return None
+        except Exception:
+            log.info("[CDP] Connection stale, reconnecting...")
+    if _auth:
+        try:
+            await _auth.stop()
+        except Exception:
+            pass
+    _pages = {}
+    _auth = CarsiAuth()
+    try:
+        await _auth.start()
+        return None
+    except RuntimeError as e:
+        _auth = None
+        return str(e)
+
+
+async def _ensure_page(db: str):
+    """Get or create a page for the database. Returns (page, error_or_None)."""
+    global _auth, _pages
+
+    err = await _ensure_connection()
+    if err:
+        return None, err
+
+    ctx = _auth.context  # type: ignore[union-attr]
+    if not ctx:
+        return None, "CDP 连接已断开"
+
+    page = _pages.get(db)
+    if page:
+        try:
+            _ = page.url
+        except Exception:
+            page = None
+            _pages.pop(db, None)
+
+    if not page:
+        db_config = get_db(db)
+        if not db_config:
+            return None, f"Unknown database: {db}"
+        domain = db_config["home_url"].split("/")[2]
+        try:
+            for p in ctx.pages:
+                if domain in p.url and "login" not in p.url.lower():
+                    page = p
+                    break
+        except Exception:
+            pass
+
+    if not page:
+        try:
+            page = await ctx.new_page()
+        except Exception as e:
+            # Context truly dead — force reconnect
+            log.info(f"[CDP] new_page failed, forcing reconnect: {e}")
+            _auth = None
+            _pages = {}
+            err = await _ensure_connection()
+            if err:
+                return None, err
+            ctx = _auth.context  # type: ignore[union-attr]
+            if not ctx:
+                return None, "CDP 重连失败"
+            page = await ctx.new_page()
+
+    _pages[db] = page
+    return page, None
+
+
+def _is_logged_in(db: str, page_text: str) -> bool:
+    """Check if user is logged in based on page text keywords."""
+    if "Are you a robot" in page_text or "Just a moment" in page_text:
+        return False
+    if db == "sciencedirect":
+        has_inst = "institutional access via" in page_text.lower()
+        has_sign_in = "Sign in" in page_text and "Sign in via" not in page_text
+        return has_inst or not has_sign_in
+    elif db == "cnki":
+        return "机构登录" not in page_text and "校外访问" not in page_text
+    else:
+        return "Institutional Sign In" not in page_text
+
+
+def _need_login_response(db: str) -> list[TextContent]:
+    """Create standardized login-required response with action prompt."""
+    db_config = get_db(db)
+    label = db_config["label"] if db_config else db
+    home = db_config["home_url"] if db_config else ""
+
+    guides = {
+        "cnki": (
+            "1. 打开已启动的 Chrome/Edge 浏览器\n"
+            "2. 访问 https://kns.cnki.net\n"
+            "3. 点击「机构登录」→「校外访问」\n"
+            "4. 选择学校并完成认证"
+        ),
+        "sciencedirect": (
+            "1. 打开已启动的 Chrome/Edge 浏览器\n"
+            "2. 访问 https://www.sciencedirect.com\n"
+            "3. 点击 Sign in → Sign in via your institution\n"
+            "4. 完成机构认证"
+        ),
+        "ieee": (
+            "1. 打开已启动的 Chrome/Edge 浏览器\n"
+            f"2. 访问 {home}\n"
+            "3. 点击 Institutional Sign In\n"
+            "4. 完成机构认证"
+        ),
+    }
+    steps = guides.get(db, guides["ieee"])
+
+    return [TextContent(type="text",
+        text=f"⚠️ 需要登录 {label}\n\n"
+             f"请在浏览器中完成以下操作：\n{steps}\n\n"
+             f"登录完成后请告知我，我将重试当前操作。\n\n"
+             f"[ACTION_REQUIRED: 请使用 AskUserQuestion 询问用户是否已完成 {label} 登录]")]
+
+
+def _need_action_response(db: str, action: str) -> list[TextContent]:
+    """Create standardized action-required response (Cloudflare, captcha)."""
+    db_config = get_db(db)
+    label = db_config["label"] if db_config else db
+    return [TextContent(type="text",
+        text=f"⚠️ 需要手动操作\n\n"
+             f"{label} {action}\n"
+             f"请在浏览器中手动完成，完成后告知我。\n\n"
+             f"[ACTION_REQUIRED: 请使用 AskUserQuestion 询问用户是否已完成操作]")]
+
+
+async def _try_cookie_session(db: str) -> bool:
+    """Try to restore session from saved cookies. Returns True on success."""
+    global _auth, _pages
+    old_auth = _auth
+
+    auth = CarsiAuth()
+    try:
+        await auth.start()
+    except RuntimeError:
+        return False
+
+    ctx = auth.context
+    if not ctx:
+        await auth.stop()
+        return False
+
+    db_config = get_db(db)
+    if not db_config:
+        await auth.stop()
+        return False
+
+    domain = db_config["home_url"].split("/")[2]
+    page = None
+    for p in ctx.pages:
+        if domain in p.url and "login" not in p.url.lower():
+            page = p
+            break
+    if not page:
+        page = await ctx.new_page()
+        await page.goto(db_config["home_url"], wait_until="domcontentloaded", timeout=30000)
+
+    url = page.url
+    if any(kw in url.lower() for kw in ["login", "wayf", "cas", "authserver"]):
+        await auth.stop()
+        return False
+    if domain not in url:
+        await auth.stop()
+        return False
+
+    try:
+        page_text = await page.evaluate("() => document.body.innerText.slice(0, 5000)")
+        if not _is_logged_in(db, page_text):
+            await auth.stop()
+            return False
+    except Exception as e:
+        log.debug(f"Login check error (ignored): {e}")
+
+    if old_auth and old_auth is not auth:
+        try:
+            await old_auth.stop()
+        except Exception as e:
+            log.debug(f"Old auth cleanup: {e}")
+
+    _auth = auth
+    _pages[db] = page
+    return True
+
+
+async def _verify_login(db: str, page) -> bool:
+    """Navigate to db home if needed and verify login status. Returns True if logged in."""
+    db_config = get_db(db)
+    if not db_config:
+        return False
+
+    domain = db_config["home_url"].split("/")[2]
+
+    try:
+        current = page.url
+    except Exception:
+        return False
+
+    if domain not in current:
+        try:
+            await page.goto(db_config["home_url"], wait_until="domcontentloaded", timeout=30000)
+        except Exception:
+            return False
+
+    try:
+        page_text = await page.evaluate("() => document.body.innerText.slice(0, 5000)")
+        return _is_logged_in(db, page_text)
+    except Exception:
+        return False
+
+
+async def _ensure_logged_in(db: str) -> tuple[PwPage | None, list[TextContent] | None]:
+    """Ensure we have a logged-in page for db. Returns (page, error_response_or_None).
+
+    Flow:
+    1. Try existing page → verify login
+    2. Try cookie restore → verify login
+    3. Return need_login_response
+    """
+    global _auth, _pages
+
+    # Step 1: if we already have a page, verify it's still logged in
+    if _auth and _pages.get(db):
+        page = _pages[db]
+        try:
+            _ = page.url
+            if await _verify_login(db, page):
+                return page, None
+        except Exception:
+            pass
+        # Page invalid or not logged in — remove it
+        _pages.pop(db, None)
+
+    # Step 2: try cookie restore
+    if await _try_cookie_session(db):
+        page = _pages[db]
+        log.info(f"[CDP] {db} session restored from cookies")
+        return page, None
+
+    # Step 3: no valid session — prompt user to login
+    return None, _need_login_response(db)
+
+
+async def _save_cookies():
+    """Save cookies if auth is active."""
+    if _auth:
+        try:
+            await _auth.save_state()
+        except Exception as e:
+            log.debug(f"Cookie save error: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Tool Definitions
 # ══════════════════════════════════════════════════════════════════════
 
 @app.list_tools()
 async def list_tools() -> list[Tool]:
-    """注册所有 MCP 工具。每个 Tool 定义了名称、描述和参数 schema。"""
     return [
-        # ── IEEE 工具 ──────────────────────────────────────────
+        # ── IEEE ──
         Tool(
             name="ieee_login",
             description="Connect Chrome via CDP and check IEEE Xplore login status. Auto-launches Chrome if needed.",
@@ -95,8 +356,7 @@ async def list_tools() -> list[Tool]:
                 "required": ["url"]
             }
         ),
-
-        # ── ScienceDirect 工具 ──────────────────────────────────
+        # ── ScienceDirect ──
         Tool(
             name="sciencedirect_login",
             description="Connect Chrome and check ScienceDirect login status. Cloudflare may require manual verification.",
@@ -137,8 +397,12 @@ async def list_tools() -> list[Tool]:
                 "required": ["url"]
             }
         ),
-
-        # ── CNKI 工具 ───────────────────────────────────────────
+        # ── CNKI ──
+        Tool(
+            name="cnki_login",
+            description="Check CNKI login status. User logs in manually in Chrome; this tool only checks and reports.",
+            inputSchema={"type": "object", "properties": {}, "required": []}
+        ),
         Tool(
             name="cnki_search",
             description="Search CNKI (中国知网) for papers. Supports advanced filters. Auto-connects Chrome if needed.",
@@ -155,11 +419,6 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["query"]
             }
-        ),
-        Tool(
-            name="cnki_login",
-            description="Check CNKI login status. User logs in manually in Chrome; this tool only checks and reports.",
-            inputSchema={"type": "object", "properties": {}, "required": []}
         ),
         Tool(
             name="cnki_detail",
@@ -183,8 +442,7 @@ async def list_tools() -> list[Tool]:
                 "required": ["url"]
             }
         ),
-
-        # ── 通用工具 ───────────────────────────────────────────
+        # ── Generic ──
         Tool(
             name="status",
             description="Check CDP connection status and list available databases.",
@@ -199,243 +457,125 @@ async def list_tools() -> list[Tool]:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Tool 调用分发
+# Tool Dispatch
 # ══════════════════════════════════════════════════════════════════════
+
+async def _dispatch(name: str, args: dict) -> list[TextContent]:
+    if name == "ieee_login":             return await handle_login("ieee")
+    if name == "ieee_search":            return await handle_search("ieee", args)
+    if name == "ieee_detail":            return await handle_detail("ieee", args)
+    if name == "ieee_download":          return await handle_download("ieee", args)
+    if name == "sciencedirect_login":    return await handle_login("sciencedirect")
+    if name == "sciencedirect_search":   return await handle_search("sciencedirect", args)
+    if name == "sciencedirect_detail":   return await handle_detail("sciencedirect", args)
+    if name == "sciencedirect_download": return await handle_download("sciencedirect", args)
+    if name == "cnki_login":             return await handle_login("cnki")
+    if name == "cnki_search":            return await handle_cnki_search(args)
+    if name == "cnki_detail":            return await handle_cnki_detail(args)
+    if name == "cnki_download":          return await handle_cnki_download(args)
+    if name == "status":                 return await handle_status()
+    if name == "logout":                 return await handle_logout()
+    return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
 
 @app.call_tool()
 async def call_tool(name: str, args: dict) -> list[TextContent]:
-    """
-    MCP tool 调用入口。根据 tool name 分发到对应的 handler 函数。
-    每次调用自动计时，结果末尾附带耗时信息。
-    """
-    global _auth, _pages
-    import time
     t0 = time.time()
     try:
-        # IEEE 工具
-        if name == "ieee_login":     result = await handle_login({"database": "ieee"})
-        elif name == "ieee_search":  args["database"] = "ieee"; result = await handle_search(args)
-        elif name == "ieee_detail":  args["database"] = "ieee"; result = await handle_detail(args)
-        elif name == "ieee_download": args["database"] = "ieee"; result = await handle_download(args)
-        # ScienceDirect 工具
-        elif name == "sciencedirect_login":     result = await handle_login({"database": "sciencedirect"})
-        elif name == "sciencedirect_search":  args["database"] = "sciencedirect"; result = await handle_search(args)
-        elif name == "sciencedirect_detail":  args["database"] = "sciencedirect"; result = await handle_detail(args)
-        elif name == "sciencedirect_download": args["database"] = "sciencedirect"; result = await handle_download(args)
-        # CNKI 工具
-        elif name == "cnki_search":  result = await handle_cnki_search(args)
-        elif name == "cnki_login":   result = await handle_cnki_login(args)
-        elif name == "cnki_detail":  result = await handle_cnki_detail(args)
-        elif name == "cnki_download": result = await handle_cnki_download(args)
-        # 通用工具
-        elif name == "status":   result = await handle_status(args)
-        elif name == "logout":   result = await handle_logout(args)
-        else: return [TextContent(type="text", text=f"Unknown tool: {name}")]
+        result = await _dispatch(name, args)
         elapsed = time.time() - t0
-        result[0].text += f"\n\n⏱ {elapsed:.1f}s"
+        if result:
+            result[0].text += f"\n\n⏱ {elapsed:.1f}s"
         return result
     except Exception as e:
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
+        log.exception(f"Tool {name} error")
+        return [TextContent(type="text", text=f"Error in {name}: {e}")]
 
 
 # ══════════════════════════════════════════════════════════════════════
-# IEEE handler 函数
+# Shared Handlers (IEEE / ScienceDirect / CNKI login)
 # ══════════════════════════════════════════════════════════════════════
 
+async def handle_login(db: str) -> list[TextContent]:
+    """Connect Chrome and check login status for any database."""
+    global _pages
 
-async def handle_login(args: dict) -> list[TextContent]:
-    """
-    连接 Chrome 并检测数据库登录状态。
-    不再自动填写表单 — 用户需在 Chrome 中手动登录，cookie 会自动保存供后续使用。
+    if db not in list_dbs():
+        return [TextContent(type="text", text=f"Unknown database: {db}. Available: {DB_LIST}")]
 
-    流程：
-    1. 通过 CDP 连接用户真实 Chrome（如果尚未连接）
-    2. 如果有已保存的 cookie，自动注入
-    3. 导航到目标数据库，检测是否已登录
-    4. 已登录 → 保存 cookie，设置全局状态
-    5. 未登录 → 提示用户在 Chrome 中手动登录，然后重试
-    """
-    global _auth, _pages
+    err = await _ensure_connection()
+    if err:
+        return [TextContent(type="text", text=err)]
 
-    database = args["database"]
-    if database not in list_dbs():
-        return [TextContent(type="text", text=f"Unknown database: {database}. Available: {DB_LIST}")]
+    ctx = _auth.context  # type: ignore[union-attr]
+    if not ctx:
+        return [TextContent(type="text", text="CDP 连接失败")]
 
-    # 连接 Chrome CDP
-    if not _auth or not _auth.context:
-        _auth = CarsiAuth()
-        try:
-            await _auth.start()
-        except RuntimeError as e:
-            return [TextContent(type="text", text=str(e))]
+    db_config = get_db(db)
+    if not db_config:
+        return [TextContent(type="text", text=f"Unknown database: {db}")]
 
-    ctx = _auth.context
-    assert ctx is not None
-    db_config = get_db(database)
-    assert db_config is not None
-    db_label = db_config["label"]
+    label = db_config["label"]
     home_url = db_config["home_url"]
-    target_domain = home_url.split("/")[2]
+    domain = home_url.split("/")[2]
 
-    # 查找已有的目标数据库标签页，或创建新页
     page = None
     for p in ctx.pages:
-        if target_domain in p.url and "login" not in p.url.lower():
+        if domain in p.url and "login" not in p.url.lower():
             page = p
             break
     if not page:
-        # 创建新标签页，不复用其他数据库的页面
         page = await ctx.new_page()
         await page.goto(home_url, wait_until="domcontentloaded", timeout=30000)
 
-    # 检测登录状态
     current_url = page.url
-    is_on_login_page = any(kw in current_url.lower() for kw in ["login", "wayf", "cas", "authserver"])
+    is_on_login = any(kw in current_url.lower() for kw in ["login", "wayf", "cas", "authserver"])
 
-    is_logged_in = False
-    if not is_on_login_page and target_domain in current_url:
+    logged_in = False
+    if not is_on_login and domain in current_url:
         try:
             page_text = await page.evaluate("() => document.body.innerText.slice(0, 5000)")
-            # 检测 Cloudflare / bot 验证
             if "Are you a robot" in page_text or "Just a moment" in page_text:
-                return [TextContent(type="text",
-                    text=f"NEED_ACTION: {db_label} 显示了 Cloudflare 验证页面。请告诉用户在 Chrome 浏览器中手动完成验证，完成后告知你，然后重试。")]
-            if database == "sciencedirect":
-                # ScienceDirect: 有 "institutional Access via" = 已登录
-                # 没有 "Sign in" 按钮也可能是已登录（页面结构变化时的兜底）
-                has_inst = "institutional Access via" in page_text or "institutional access via" in page_text
-                has_sign_in = "Sign in" in page_text and "Sign in via" not in page_text
-                is_logged_in = has_inst or not has_sign_in
-            elif database == "cnki":
-                not_logged = "机构登录" in page_text or "校外访问" in page_text
-                is_logged_in = not not_logged
-            else:
-                not_logged = "Institutional Sign In" in page_text
-                is_logged_in = not not_logged
-        except Exception:
-            is_logged_in = True
+                return _need_action_response(db, "显示了 Cloudflare 验证页面。")
+            logged_in = _is_logged_in(db, page_text)
+        except Exception as e:
+            log.debug(f"Login check error: {e}")
+            logged_in = True
 
-    if is_logged_in:
-        _pages[database] = page
-        await _auth.save_state()
+    if logged_in:
+        _pages[db] = page
+        await _save_cookies()
         return [TextContent(type="text",
-            text=f"✅ 已连接 {db_label}。\n"
+            text=f"✅ 已连接 {label}。\n"
                  f"URL: {current_url[:120]}\n"
                  f"Cookie 已保存，下次启动自动恢复。")]
     else:
-        return [TextContent(type="text",
-            text=f"NEED_LOGIN: 尚未登录 {db_label}。请告诉用户在 Chrome 浏览器中手动登录 {db_label}，登录完成后告知你，然后重试。")]
-
-async def _try_cookie_session(db: str) -> bool:
-    """
-    尝试通过 CDP 连接 + 已保存的 cookie 恢复会话。
-
-    流程：
-    1. 创建 CarsiAuth 实例并通过 CDP 连接用户 Chrome
-    2. 自动注入已保存的 cookie（如果存在）
-    3. 导航到目标数据库，检查是否已登录
-    4. 成功则设置全局变量并返回 True
-    """
-    global _auth, _pages
-    from carsi_search.engine import CarsiAuth
-    auth = CarsiAuth()
-    try:
-        await auth.start()
-    except RuntimeError:
-        return False
-
-    ctx = auth.context
-    assert ctx is not None
-    from carsi_search.registry import get_db as _get_db
-    db_config = _get_db(db)
-    if not db_config:
-        await auth.stop()
-        return False
-
-    target_domain = db_config["home_url"].split("/")[2]
-    # 查找已有标签页
-    page = None
-    for p in ctx.pages:
-        if target_domain in p.url and "login" not in p.url.lower():
-            page = p
-            break
-    if not page:
-        # 创建新标签页，不复用其他数据库的页面
-        page = await ctx.new_page()
-        await page.goto(db_config["home_url"], wait_until="domcontentloaded", timeout=30000)
-
-    # 检查是否已登录
-    url = page.url
-    if (target_domain in url
-            and "login" not in url.lower()
-            and "wayf" not in url.lower()
-            and "cas" not in url.lower()):
-        try:
-            page_text = await page.evaluate("() => document.body.innerText.slice(0, 5000)")
-            # 检测 Cloudflare
-            if "Are you a robot" in page_text or "Just a moment" in page_text:
-                await auth.stop()
-                return False
-            if db == "sciencedirect":
-                has_inst = "institutional Access via" in page_text or "institutional access via" in page_text
-                has_sign_in = "Sign in" in page_text and "Sign in via" not in page_text
-                if not has_inst and has_sign_in:
-                    await auth.stop()
-                    return False
-            elif db == "cnki":
-                if "机构登录" in page_text or "校外访问" in page_text:
-                    await auth.stop()
-                    return False
-            else:
-                if "Institutional Sign In" in page_text:
-                    await auth.stop()
-                    return False
-        except Exception:
-            pass
-        _auth = auth
-        _pages[db] = page
-        return True
-
-    await auth.stop()
-    return False
+        return _need_login_response(db)
 
 
-async def handle_search(args: dict) -> list[TextContent]:
-    """
-    CARSI 数据库搜索。如果没有活跃会话，先尝试从 Cookie 恢复。
-    返回格式化的论文列表（标题、作者、年份、来源、摘要、URL）。
-    """
-    global _auth, _pages
+async def handle_search(db: str, args: dict) -> list[TextContent]:
+    """Search papers in IEEE or ScienceDirect."""
+    page, err = await _ensure_logged_in(db)
+    if err or not page:
+        return err or _need_login_response(db)
 
-    db = args.get("database")
-    if not db:
-        return [TextContent(type="text", text="No database. Use ieee_search or sciencedirect_search.")]
-
-    # 如果没有活跃的浏览器会话，尝试从 Cookie 恢复
-    if not _auth or not _pages.get(db):
-        if not await _try_cookie_session(db):
-            return [TextContent(type="text",
-                text=f"NEED_LOGIN: {db} 未登录。请告诉用户在 Chrome 浏览器中手动登录 {db}，登录完成后告知你，然后重试此操作。")]
-        log.info("[CDP] Session restored from cookies")
-
-    adapter = await get_adapter(db, _pages[db])
+    adapter = await get_adapter(db, page)
     result = await adapter.search(args["query"], page=args.get("page", 1))
 
     if not result.get("success"):
         err = result.get("error", "")
         if err == "captcha":
-            return [TextContent(type="text",
-                text='NEED_ACTION: ScienceDirect 显示了 Cloudflare 验证。请告诉用户在 Chrome 浏览器中手动完成验证，完成后告知你，然后重试搜索。')]
+            return _need_action_response(db, "显示了验证页面。")
         return [TextContent(type="text", text=f"Search failed: {err}")]
 
     papers = result.get("papers", [])
     if not papers:
-        return [TextContent(type="text", text="No papers found. May need login or DB unavailable.")]
+        return [TextContent(type="text", text="No papers found.")]
 
     total = result.get("total", "")
     total_str = f" (total: {total})" if total else ""
-    page = args.get("page", 1)
-    text = f"Page {page}, {len(papers)} papers{total_str}:\n\n"
+    page_num = args.get("page", 1)
+    text = f"Page {page_num}, {len(papers)} papers{total_str}:\n\n"
     for i, p in enumerate(papers, 1):
         text += f"{i}. **{p.get('title', 'No title')}**\n"
         if p.get('authors'): text += f"   Authors: {p['authors']}\n"
@@ -444,36 +584,25 @@ async def handle_search(args: dict) -> list[TextContent]:
         if p.get('abstract'): text += f"   Abstract: {p['abstract'][:200]}...\n"
         if p.get('url'): text += f"   URL: {p['url']}\n"
         text += "\n"
-    text += "-> Use detail(url=URL) for full metadata"
-    # 搜索成功后保存 cookie，确保会话持久化
-    if _auth:
-        try: await _auth.save_state()
-        except: pass
+    text += f"-> Use {db}_detail(url=URL) for full metadata"
+
+    await _save_cookies()
     return [TextContent(type="text", text=text)]
 
 
-async def handle_detail(args: dict) -> list[TextContent]:
-    """
-    获取 CARSI 数据库中论文的完整元数据。
-    包括：摘要、作者、单位、年份、期刊、DOI、关键词、PDF 链接、引用格式。
-    """
-    global _auth, _pages
+async def handle_detail(db: str, args: dict) -> list[TextContent]:
+    """Get paper details from IEEE or ScienceDirect."""
+    page, err = await _ensure_logged_in(db)
+    if err or not page:
+        return err or _need_login_response(db)
 
-    db = args.get("database")
-    if not _auth or not _pages.get(db or "ieee"):
-        if not await _try_cookie_session(db or "ieee"):
-            return [TextContent(type="text",
-                text=f"NEED_LOGIN: 未登录。请告诉用户在 Chrome 浏览器中登录 {db or 'ieee'}，登录完成后告知你，然后重试。")]
-        log.info("[CDP] Session restored from cookies")
-
-    adapter = await get_adapter(db or "ieee", _pages[db or "ieee"])
+    adapter = await get_adapter(db, page)
     result = await adapter.detail(args["url"])
 
     if not result.get("success"):
         err = result.get("error", "")
         if err == "captcha":
-            return [TextContent(type="text",
-                text='NEED_ACTION: ScienceDirect 详情页显示了 Cloudflare 验证。请告诉用户在 Chrome 中手动完成验证，完成后告知你，然后重试。')]
+            return _need_action_response(db, "详情页显示了验证页面。")
         return [TextContent(type="text", text=f"Detail failed: {err}")]
 
     text = ""
@@ -494,266 +623,248 @@ async def handle_detail(args: dict) -> list[TextContent]:
     if result.get("pubDate"): text += f"**Published**: {result['pubDate']}\n"
     if result.get("pdfUrl"):
         text += f"**PDF**: {result['pdfUrl']}\n"
-        text += f"**Download**: use download(url=\"{result['pdfUrl']}\")\n"
+        text += f"**Download**: use {db}_download(url=\"{result['pdfUrl']}\")\n"
     if result.get("citation"): text += f"\n**Citation**\n{result['citation']}\n"
 
-    # 详情获取成功后保存 cookie
-    if _auth:
-        try: await _auth.save_state()
-        except: pass
+    await _save_cookies()
     return [TextContent(type="text", text=text or "No details extracted.")]
 
 
-async def handle_download(args: dict) -> list[TextContent]:
-    """
-    CARSI 数据库论文 PDF 下载处理。
+# ══════════════════════════════════════════════════════════════════════
+# Download Helpers
+# ══════════════════════════════════════════════════════════════════════
 
-    === 下载流程 ===
-    1. 如果 URL 不是 PDF 直链，先调用 detail() 获取 PDF URL
-    2. 将 IEEE 的 stamp.jsp URL 转换为 getPDF.jsp 直接下载端点
-    3. 通过浏览器内 JS fetch 请求 PDF（利用浏览器的 CARSI 认证 Cookie）
-    4. 将 PDF 二进制数据 base64 编码传回 Python
-    5. 解码后验证 PDF 头 (%PDF)，防止下载到 HTML 错误页面
-    6. 保存到 DOWNLOAD_DIR/downloads/ 目录，文件名为论文标题
+async def _resolve_pdf_url(db: str, page, url: str, title: str):
+    """Resolve URL to a direct PDF link. Returns (pdf_url, title, error_or_None)."""
+    if any(kw in url for kw in ["stamp.jsp", "/pdf/", "getPDF.jsp", "pdfft"]):
+        return url, title, None
 
-    === 重要警告 ===
-    CNKI 的下载有独立的处理函数 handle_cnki_download()，不走此路径。
-    所有数据库共用同一个 CDP 连接（用户真实 Chrome）。
-    """
-    global _auth, _pages
+    adapter = await get_adapter(db, page)
+    detail_result = await adapter.detail(url)
+    if detail_result.get("error") == "captcha":
+        return url, title, "captcha"
+    if detail_result.get("pdfUrl"):
+        url = detail_result["pdfUrl"]
+    if not title and detail_result.get("title"):
+        title = detail_result["title"]
+    return url, title, None
 
-    db = args.get("database")
-    if not _auth or not _pages.get(db or "ieee"):
-        if not await _try_cookie_session(db or "ieee"):
-            return [TextContent(type="text",
-                text=f"NEED_LOGIN: 未登录 {db or 'ieee'}。请告诉用户在 Chrome 浏览器中登录 {db or 'ieee'}，登录完成后告知你，然后重试下载。")]
-        log.info("[CDP] Session restored from cookies")
 
-    page = _pages[db or "ieee"]
-    url = args["url"]
-    title = args.get("title", "")
-
-    # 第一步：如果 URL 不是 PDF 直链，先获取论文详情找到 PDF 链接
-    if "stamp.jsp" not in url and "/pdf/" not in url and "getPDF.jsp" not in url and "pdfft" not in url:
-        adapter = await get_adapter(db or "ieee", page)
-        detail_result = await adapter.detail(url)
-        if detail_result.get("error") == "captcha":
-            return [TextContent(type="text",
-                text='NEED_ACTION: ScienceDirect 下载需要验证。请告诉用户在 Chrome 浏览器中手动完成 Cloudflare 验证，完成后告知你，然后重试下载。')]
-        if detail_result.get("pdfUrl"):
-            url = detail_result["pdfUrl"]
-        if not title and detail_result.get("title"):
-            title = detail_result["title"]
-
-    # IEEE 回退：如果 detail 没找到 pdfUrl，从 arnumber 构建
+def _ieee_pdf_url(url: str) -> str:
+    """Convert IEEE document/stamp URLs to getPDF.jsp endpoint."""
     if "/document/" in url and "getPDF" not in url:
-        import re as _re
-        m = _re.search(r'/document/(\d+)', url)
+        m = re.search(r'/document/(\d+)', url)
         if m:
-            url = f"https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={m.group(1)}"
-
-    # 第二步：将 IEEE stamp.jsp 转换为 getPDF.jsp 直接下载端点
+            return f"https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={m.group(1)}"
     if "stamp.jsp" in url:
         arnumber = url.split("arnumber=")[-1] if "arnumber=" in url else ""
         if arnumber:
-            url = f"https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={arnumber}"
+            return f"https://ieeexplore.ieee.org/stampPDF/getPDF.jsp?tp=&arnumber={arnumber}"
+    return url
 
-    # 第三步：通过浏览器下载 PDF
-    # ScienceDirect: 需要先导航到 pdfft URL（重定向到 pdf.sciencedirectassets.com），再 fetch
-    # IEEE: 直接 fetch 即可
-    import base64, re
 
-    is_sciencedirect = "sciencedirect" in url or "sciencedirectassets" in page.url
+_FETCH_PDF_JS = """
+    async (targetUrl) => {
+        try {
+            const resp = await fetch(targetUrl);
+            if (!resp.ok) return 'HTTP ' + resp.status;
+            const buf = await resp.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+            return btoa(binary);
+        } catch(e) {
+            return 'ERROR:' + e.message;
+        }
+    }
+"""
 
-    if is_sciencedirect and "/pdfft" in url:
-        # ScienceDirect: 导航到 PDF 页面，等重定向到 pdf.sciencedirectassets.com
-        try: await page.unroute("**/*")
-        except: pass
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        # 等重定向完成
-        for _ in range(20):
-            await asyncio.sleep(1)
-            if "sciencedirectassets" in page.url:
-                break
+_FETCH_CURRENT_PAGE_JS = """
+    async () => {
+        try {
+            const resp = await fetch(window.location.href);
+            if (!resp.ok) return 'HTTP ' + resp.status;
+            const buf = await resp.arrayBuffer();
+            const bytes = new Uint8Array(buf);
+            let binary = '';
+            for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+            return btoa(binary);
+        } catch(e) {
+            return 'ERROR:' + e.message;
+        }
+    }
+"""
 
-        # 检测 Cloudflare 验证
-        page_text = await page.evaluate("() => document.body?.innerText?.slice(0, 500) || ''")
-        if "robot" in page_text.lower():
-            for _ in range(40):
-                await asyncio.sleep(3)
-                page_text = await page.evaluate("() => document.body?.innerText?.slice(0, 500) || ''")
-                if "robot" not in page_text.lower():
-                    break
+
+async def _sd_navigate_and_fetch(page, url: str) -> str | None:
+    """Navigate to ScienceDirect PDF URL, handle Cloudflare, return base64 or None.
+
+    Cloudflare verification can destroy the execution context. After user completes
+    the challenge manually, the page reloads — we wait and retry evaluate.
+    """
+    try:
+        await page.unroute("**/*")
+    except Exception:
+        pass
+
+    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    for _ in range(20):
+        await asyncio.sleep(1)
+        if "sciencedirectassets" in page.url:
+            break
+
+    # Check for Cloudflare bot challenge — wait for user to complete it
+    for attempt in range(60):
+        try:
+            page_text = await page.evaluate("() => document.body?.innerText?.slice(0, 500) || ''")
+        except Exception:
+            # Context destroyed (Cloudflare verification caused navigation)
+            await asyncio.sleep(2)
+            continue
+
+        if "robot" not in page_text.lower() and "just a moment" not in page_text.lower():
+            break
+        await asyncio.sleep(3)
+    else:
+        return None
+
+    # Wait for page to stabilize after Cloudflare pass
+    await asyncio.sleep(2)
+
+    # Retry evaluate with resilience to context destruction
+    for retry in range(3):
+        try:
+            return await page.evaluate(_FETCH_CURRENT_PAGE_JS)
+        except Exception as e:
+            if retry < 2:
+                log.debug(f"SD fetch retry {retry+1}: {e}")
+                await asyncio.sleep(2)
             else:
-                return [TextContent(type="text",
-                    text='NEED_ACTION: ScienceDirect PDF 域名显示了 Cloudflare 验证。请告诉用户在 Chrome 浏览器中手动完成验证，完成后告知你，然后重试下载。')]
+                log.info(f"SD fetch failed after retries: {e}")
+                return None
 
-        await asyncio.sleep(2)
 
-        # 从当前 PDF 页面 fetch
-        pdf_b64 = await page.evaluate("""
-            async () => {{
-                try {{
-                    const resp = await fetch(window.location.href);
-                    if (!resp.ok) return 'HTTP ' + resp.status;
-                    const buf = await resp.arrayBuffer();
-                    const bytes = new Uint8Array(buf);
-                    let binary = '';
-                    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-                    return btoa(binary);
-                }} catch(e) {{
-                    return 'ERROR:' + e.message;
-                }}
-            }}
-        """)
+def _save_pdf(pdf_data: bytes, title: str) -> Path:
+    """Save PDF bytes to downloads directory."""
+    downloads_dir = Path(os.getcwd()) / "downloads"
+    downloads_dir.mkdir(exist_ok=True)
+    if title:
+        safe_title = re.sub(r'[<>:"/\\|?*]', '', title).strip()[:80]
+        filename = f"{safe_title}.pdf"
     else:
-        # IEEE: 直接 fetch
-        try: await page.unroute("**/*")
-        except: pass
-        pdf_b64 = await page.evaluate(f"""
-            async () => {{
-                try {{
-                    const resp = await fetch('{url}');
-                    if (!resp.ok) return 'HTTP ' + resp.status;
-                    const buf = await resp.arrayBuffer();
-                    const bytes = new Uint8Array(buf);
-                    let binary = '';
-                    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-                    return btoa(binary);
-                }} catch(e) {{
-                    return 'ERROR:' + e.message;
-                }}
-            }}
-        """)
+        filename = f"paper_{int(time.time())}.pdf"
+    save_path = downloads_dir / filename
+    save_path.write_bytes(pdf_data)
+    return save_path
 
-    if pdf_b64 and not pdf_b64.startswith('ERROR:') and not pdf_b64.startswith('HTTP '):
-        pdf_data = base64.b64decode(pdf_b64)
-        # 第四步：验证 PDF 文件头 —— fetch 可能返回 200 但内容是 HTML 错误页面
-        if pdf_data[:4] != b'%PDF':
-            # 返回的不是 PDF，可能是登录过期或权限不足导致的 HTML 页面
-            snippet = pdf_data[:200].decode('utf-8', errors='replace')
-            await page.goto(url.replace('getPDF.jsp', 'stamp.jsp'), wait_until="domcontentloaded", timeout=45000)
-            return [TextContent(type="text",
-                text=f"Download failed: response is not a PDF (可能是登录过期或权限不足).\n"
-                     f"Opened page in browser for manual download.\nFirst bytes: {snippet[:100]}")]
-        # 第五步：保存 PDF 到本地
-        # 下载到调用者项目目录下的 downloads/ 文件夹
-        downloads_dir = Path(os.getcwd()) / "downloads"
-        downloads_dir.mkdir(exist_ok=True)
-        if title:
-            # 文件名安全处理：移除非法字符，限制长度
-            safe_title = re.sub(r'[<>:"/\\|?*]', '', title).strip()
-            safe_title = safe_title[:80]  # limit length
-            filename = f"{safe_title}.pdf"
-        else:
-            filename = f"paper_{int(__import__('time').time())}.pdf"
-        save_path = downloads_dir / filename
-        save_path.write_bytes(pdf_data)
-        # 下载成功后保存 cookie
-        if _auth:
-            try: await _auth.save_state()
-            except: pass
-        return [TextContent(type="text",
-            text=f"Downloaded PDF ({len(pdf_data)} bytes)\nSaved: {save_path}")]
+
+# ══════════════════════════════════════════════════════════════════════
+# Download Handler (IEEE / ScienceDirect)
+# ══════════════════════════════════════════════════════════════════════
+
+async def handle_download(db: str, args: dict) -> list[TextContent]:
+    """Download PDF from IEEE or ScienceDirect."""
+    page, err = await _ensure_logged_in(db)
+    if err or not page:
+        return err or _need_login_response(db)
+
+    url = args["url"]
+    title = args.get("title", "")
+
+    url, title, resolve_err = await _resolve_pdf_url(db, page, url, title)
+    if resolve_err == "captcha":
+        return _need_action_response(db, "详情页显示了验证页面。")
+
+    if db == "ieee":
+        url = _ieee_pdf_url(url)
+
+    is_sd = "sciencedirect" in url or "sciencedirectassets" in page.url
+    if is_sd and "/pdfft" in url:
+        pdf_b64 = await _sd_navigate_and_fetch(page, url)
+        if pdf_b64 is None:
+            return _need_action_response(db, "PDF 域名显示了 Cloudflare 验证。")
     else:
-        # 下载失败：回退到在浏览器中打开页面，让用户手动下载
-        await page.goto(url.replace('getPDF.jsp', 'stamp.jsp'), wait_until="domcontentloaded", timeout=45000)
-        await asyncio.sleep(2)
+        try:
+            await page.unroute("**/*")
+        except Exception:
+            pass
+        pdf_b64 = await page.evaluate(_FETCH_PDF_JS, url)
+
+    if not pdf_b64 or pdf_b64.startswith('ERROR:') or pdf_b64.startswith('HTTP '):
+        await page.goto(
+            url.replace('getPDF.jsp', 'stamp.jsp'),
+            wait_until="domcontentloaded", timeout=45000,
+        )
         return [TextContent(type="text",
-            text=f"Could not auto-download ({pdf_b64[:80]}). Opened in browser.\nURL: {page.url[:200]}")]
+            text=f"自动下载失败 ({pdf_b64[:80] if pdf_b64 else 'empty'})。已在浏览器中打开。\n"
+                 f"URL: {page.url[:200]}")]
+
+    pdf_data = base64.b64decode(pdf_b64)
+    if pdf_data[:4] != b'%PDF':
+        snippet = pdf_data[:200].decode('utf-8', errors='replace')
+        await page.goto(
+            url.replace('getPDF.jsp', 'stamp.jsp'),
+            wait_until="domcontentloaded", timeout=45000,
+        )
+        return [TextContent(type="text",
+            text=f"下载失败：返回内容不是 PDF（可能登录过期）。\n"
+                 f"已在浏览器中打开。\nFirst bytes: {snippet[:100]}")]
+
+    save_path = _save_pdf(pdf_data, title)
+    await _save_cookies()
+    return [TextContent(type="text",
+        text=f"Downloaded PDF ({len(pdf_data)} bytes)\nSaved: {save_path}")]
 
 
-async def handle_status(_args: dict) -> list[TextContent]:
-    """显示当前会话状态：已注册的数据库列表、已登录的数据库、CDP 连接状态。"""
-    global _auth, _pages
+# ══════════════════════════════════════════════════════════════════════
+# Generic Handlers
+# ══════════════════════════════════════════════════════════════════════
 
+async def handle_status() -> list[TextContent]:
     lines = [f"**Registered databases**: {DB_LIST}"]
     for name in list_dbs():
         db = get_db(name)
-        assert db is not None
+        if not db:
+            continue
         logged_in = name in _pages
-        marker = " < logged in" if logged_in else ""
+        marker = " ← logged in" if logged_in else ""
         lines.append(f"  - `{name}`: {db['label']}{marker}")
 
     if _auth and _auth.context:
-        lines.append(f"\nCDP 连接: 已连接")
-        if _pages:
-            for db_name, pg in _pages.items():
+        lines.append("\nCDP 连接: 已连接")
+        for db_name, pg in _pages.items():
+            try:
                 lines.append(f"  {db_name}: {pg.url[:80]}")
+            except Exception:
+                lines.append(f"  {db_name}: (page invalid)")
     else:
-        lines.append("\nCDP 连接: 未连接。使用对应数据库的 login 工具连接。")
+        lines.append("\nCDP 连接: 未连接。使用 {db}_login 工具连接。")
 
     return [TextContent(type="text", text="\n".join(lines))]
 
 
-async def handle_logout(_args: dict) -> list[TextContent]:
-    """断开 CDP 连接，重置全局状态。不会关闭用户的真实 Chrome 浏览器。"""
+async def handle_logout() -> list[TextContent]:
     global _auth, _pages
-
     if _auth:
         await _auth.clear_state()
-        try: await _auth.stop()
-        except Exception: pass
+        try:
+            await _auth.stop()
+        except Exception as e:
+            log.debug(f"Logout cleanup: {e}")
     _auth = None
     _pages = {}
-    return [TextContent(type="text", text="已断开 CDP 连接。Chrome 浏览器保持打开，下次使用需重新连接。")]
+    return [TextContent(type="text", text="已断开 CDP 连接。浏览器保持打开。")]
 
 
 # ══════════════════════════════════════════════════════════════════════
-# CNKI handler 函数
-#
-# CNKI 和 IEEE 共用同一个 CDP 连接。
-# 知网有反爬机制，必须用真实 Chrome CDP。
-# CNKI handler 首次调用时自动连接 Chrome。
+# CNKI Handlers
 # ══════════════════════════════════════════════════════════════════════
-
-
-async def handle_cnki_login(_args: dict) -> list[TextContent]:
-    """
-    CNKI 登录 —— no-op（空操作）。
-
-    所有数据库（包括 CNKI）都通过 CDP 连接用户真实 Chrome，登录状态直接使用 Chrome 中已有的会话。
-    用户只需在 Chrome 中手动登录 CNKI 即可使用 cnki_search/cnki_detail/cnki_download。
-    """
-    return [TextContent(type="text",
-        text="所有数据库统一使用 CDP 连接真实 Chrome 的登录态，无需单独登录。\n"
-             "请在 Chrome 中登录 CNKI 后直接使用 cnki_search/cnki_detail/cnki_download。")]
-
 
 async def handle_cnki_search(args: dict) -> list[TextContent]:
-    """
-    CNKI 论文搜索。通过 CDP 连接用户真实 Chrome，打开知网搜索页，使用 CnkiAdapter 解析结果。
-    搜索无需登录，但遇到验证码时需要用户在浏览器中手动完成。
-    """
-    global _auth, _pages
-    if not _auth or not _auth.context:
-        from carsi_search.engine import CarsiAuth
-        _auth = CarsiAuth()
-        try:
-            await _auth.start()
-        except RuntimeError as e:
-            return [TextContent(type="text", text=str(e))]
-    ctx = _auth.context
-    assert ctx is not None
-    # 优先使用已缓存的 CNKI 页面
-    page = _pages.get("cnki")
-    if page:
-        try:
-            _ = page.url  # 检查页面是否还有效
-        except Exception:
-            page = None
-    # 查找已有的 CNKI 标签页
-    if not page:
-        for p in ctx.pages:
-            if 'cnki.net' in p.url:
-                page = p
-                break
-    # 创建新标签页（不复用其他数据库的页面）
-    if not page:
-        page = await ctx.new_page()
-    _pages["cnki"] = page
+    page, err = await _ensure_page("cnki")
+    if err or not page:
+        return [TextContent(type="text", text=err or "Failed to get CNKI page")]
 
-    from carsi_search.databases.cnki import CnkiAdapter
     adapter = CnkiAdapter(page)
     result = await adapter.search(
         args["query"],
@@ -766,10 +877,10 @@ async def handle_cnki_search(args: dict) -> list[TextContent]:
     )
 
     if not result.get("success"):
-        err = result.get("error", "unknown")
-        if err == "captcha":
-            return [TextContent(type="text", text="CNKI 正在显示滑块验证码。请在浏览器中手动完成验证后重试。")]
-        return [TextContent(type="text", text=f"CNKI search failed: {err}")]
+        err_msg = result.get("error", "unknown")
+        if err_msg == "captcha":
+            return _need_action_response("cnki", "正在显示滑块验证码。")
+        return [TextContent(type="text", text=f"CNKI search failed: {err_msg}")]
 
     papers = result.get("papers", [])
     total = result.get("total", "?")
@@ -788,45 +899,18 @@ async def handle_cnki_search(args: dict) -> list[TextContent]:
 
 
 async def handle_cnki_detail(args: dict) -> list[TextContent]:
-    """
-    获取 CNKI 论文详情。通过 CDP 连接用户真实 Chrome，访问论文详情页，提取完整元数据。
-    无需登录，但遇到验证码时需要用户手动处理。
-    """
-    global _auth, _pages
-    if not _auth or not _auth.context:
-        from carsi_search.engine import CarsiAuth
-        _auth = CarsiAuth()
-        try:
-            await _auth.start()
-        except RuntimeError as e:
-            return [TextContent(type="text", text=str(e))]
-    ctx = _auth.context
-    assert ctx is not None
-    # 优先使用已缓存的 CNKI 页面
-    page = _pages.get("cnki")
-    if page:
-        try:
-            _ = page.url
-        except Exception:
-            page = None
-    if not page:
-        for p in ctx.pages:
-            if 'cnki.net' in p.url:
-                page = p
-                break
-    if not page:
-        page = await ctx.new_page()
-    _pages["cnki"] = page
+    page, err = await _ensure_page("cnki")
+    if err or not page:
+        return [TextContent(type="text", text=err or "Failed to get CNKI page")]
 
-    from carsi_search.databases.cnki import CnkiAdapter
     adapter = CnkiAdapter(page)
     result = await adapter.detail(args["url"])
 
     if not result.get("success"):
-        err = result.get("error", "unknown")
-        if err == "captcha":
-            return [TextContent(type="text", text="CNKI 验证码。请在浏览器中手动完成后重试。")]
-        return [TextContent(type="text", text=f"CNKI detail failed: {err}")]
+        err_msg = result.get("error", "unknown")
+        if err_msg == "captcha":
+            return _need_action_response("cnki", "验证码。")
+        return [TextContent(type="text", text=f"CNKI detail failed: {err_msg}")]
 
     text = ""
     if result.get("title"): text += f"**{result['title']}**\n\n"
@@ -844,52 +928,18 @@ async def handle_cnki_detail(args: dict) -> list[TextContent]:
 
 
 async def handle_cnki_download(args: dict) -> list[TextContent]:
-    """
-    CNKI 论文 PDF/CAJ 下载。
+    """CNKI download using CDP setDownloadBehavior.
 
-    === 下载流程 ===
-    1. 通过共享的 CDP 连接访问用户真实 Chrome，查找或复用 CNKI 标签页
-    2. 导航到论文详情页，等待页面加载
-    3. 检查登录状态：如果用户未登录知网，提示先在 Chrome 中登录
-    4. 检查验证码：如果出现滑块验证码，提示用户手动完成
-    5. 查找下载按钮 (#pdfDown 或 .btn-dlpdf a)
-    6. 使用 Playwright 的 expect_download 拦截浏览器原生下载事件
-    7. 将下载的文件保存到 DOWNLOAD_DIR/downloads/ 目录
-
-    注意：用户必须在 Chrome 中已登录 CNKI，否则无法下载。
+    In CDP (connect_over_cdp) mode, Playwright's download.save_as() / download.path()
+    often produce 0-byte files because Playwright can't access the browser's temp files.
+    Instead, we use CDP's Browser.setDownloadBehavior to tell the browser to save directly
+    to our target directory, then poll for the file to appear.
     """
-    global _auth, _pages
-    if not _auth or not _auth.context:
-        from carsi_search.engine import CarsiAuth
-        _auth = CarsiAuth()
-        try:
-            await _auth.start()
-        except RuntimeError as e:
-            return [TextContent(type="text", text=str(e))]
-    ctx = _auth.context
-    assert ctx is not None
-    # 优先使用已缓存的 CNKI 页面
-    page = _pages.get("cnki")
-    if page:
-        try:
-            _ = page.url  # 检查页面是否还有效
-        except Exception:
-            page = None
-    # 查找已有的 CNKI 标签页
-    if not page:
-        for p in ctx.pages:
-            if 'cnki.net' in p.url:
-                page = p
-                break
-    # 创建新标签页（不复用其他数据库的页面）
-    if not page:
-        page = await ctx.new_page()
-    _pages["cnki"] = page
+    page, err = await _ensure_page("cnki")
+    if err or not page:
+        return [TextContent(type="text", text=err or "Failed to get CNKI page")]
 
     url = args["url"]
-    from playwright.async_api import Error as PwError
-
-    # 导航到论文详情页
     await page.goto(url, wait_until='domcontentloaded', timeout=30000)
     try:
         await page.wait_for_selector('.brief h1', timeout=15000)
@@ -897,93 +947,120 @@ async def handle_cnki_download(args: dict) -> list[TextContent]:
         pass
     await asyncio.sleep(1)
 
-    # 检查登录状态：页面是否显示"机构登录"/"校外访问"（有则说明未登录）
     page_text = await page.evaluate("() => document.body.innerText.slice(0, 3000)")
-    not_logged = "机构登录" in page_text or "校外访问" in page_text
-    if not_logged:
-        return [TextContent(type="text",
-            text='NEED_LOGIN: CNKI 未登录。请告诉用户在 Chrome 浏览器中点击"机构登录"登录知网，登录完成后告知你，然后重试下载。')]
+    if "机构登录" in page_text or "校外访问" in page_text:
+        return _need_login_response("cnki")
 
-    # 检查是否出现滑块验证码
     captcha = await page.evaluate("""() => {
         const el = document.querySelector('#tcaptcha_transform_dy');
         return el && el.getBoundingClientRect().top >= 0;
     }""")
     if captcha:
-        return [TextContent(type="text", text="CNKI 验证码。请在浏览器中手动完成后重试。")]
+        return _need_action_response("cnki", "正在显示滑块验证码。")
 
-    # 检查是否有下载链接
     has_pdf = await page.evaluate("() => !!document.querySelector('#pdfDown, .btn-dlpdf a')")
     if not has_pdf:
         return [TextContent(type="text", text="未找到下载链接。")]
 
-    # 点击下载按钮并拦截浏览器原生下载事件
-    import shutil
+    save_dir = Path(os.getcwd()) / "downloads"
+    save_dir.mkdir(exist_ok=True)
+
+    # Record existing files before download
+    existing_files = set(save_dir.iterdir())
+
+    # Use CDP to redirect browser downloads to our target directory
+    cdp = await page.context.new_cdp_session(page)
     try:
-        async with page.expect_download(timeout=60000) as dl_info:
-            await page.locator('#pdfDown, .btn-dlpdf a').first.click()
-        dl = await dl_info.value
-        fname = dl.suggested_filename or 'paper.pdf'
-        save_dir = Path(os.getcwd()) / "downloads"
-        save_dir.mkdir(exist_ok=True)
-        save_path = save_dir / fname
+        await cdp.send("Browser.setDownloadBehavior", {
+            "behavior": "allowAndName",
+            "downloadPath": str(save_dir.resolve()),
+            "eventsEnabled": True,
+        })
+    except Exception as e:
+        log.debug(f"CDP setDownloadBehavior failed, trying Page-level: {e}")
+        try:
+            await cdp.send("Page.setDownloadBehavior", {
+                "behavior": "allow",
+                "downloadPath": str(save_dir.resolve()),
+            })
+        except Exception as e2:
+            log.info(f"CDP download redirect failed: {e2}")
 
-        # dl.path() 会等下载完成，但 CNKI 的下载可能写入延迟
-        # 先用 save_as（内部会等下载完成），更可靠
-        await dl.save_as(str(save_path))
+    # Click download button
+    await page.locator('#pdfDown, .btn-dlpdf a').first.click()
 
-        # 如果 save_as 产出空文件，回退到 dl.path() + 等待文件写入
-        if save_path.stat().st_size == 0:
-            tmp = await dl.path()
-            if tmp and Path(tmp).exists():
-                # 等待文件写入完成（最多 30s）
-                for _ in range(30):
-                    size1 = Path(tmp).stat().st_size
-                    await asyncio.sleep(1)
-                    size2 = Path(tmp).stat().st_size
-                    if size1 == size2 and size2 > 0:
-                        break
-                shutil.copy2(str(tmp), str(save_path))
+    # Wait for new file to appear in save_dir (poll up to 60s)
+    new_file = None
+    for _ in range(60):
+        await asyncio.sleep(1)
+        current_files = set(save_dir.iterdir())
+        new_files = current_files - existing_files
+        # Filter out partial downloads (.crdownload, .tmp, .part)
+        completed = [
+            f for f in new_files
+            if not f.suffix.lower() in ('.crdownload', '.tmp', '.part', '.download')
+            and f.stat().st_size > 0
+        ]
+        if completed:
+            new_file = completed[0]
+            # Wait for file to finish writing (size stabilizes)
+            prev_size = new_file.stat().st_size
+            await asyncio.sleep(1)
+            curr_size = new_file.stat().st_size
+            if curr_size == prev_size and curr_size > 0:
+                break
+            # Still writing, keep waiting
+            new_file = None
 
-        # 验证
-        file_size = save_path.stat().st_size
-        if file_size == 0:
-            # 调试：检查下载失败原因
-            failure = await dl.failure()
-            tmp = await dl.path()
-            tmp_size = Path(tmp).stat().st_size if tmp and Path(tmp) else -1
-            return [TextContent(type="text",
-                text=f"NEED_LOGIN: CNKI 下载失败（文件为空）。\n"
-                     f"调试: url={dl.url[:100]}, file={fname}, "
-                     f"failure={failure}, tmp={tmp}, tmp_size={tmp_size}\n"
-                     f"请告诉用户在 Chrome 浏览器中重新登录 CNKI，登录完成后告知你，然后重试。")]
+    # Cleanup CDP session
+    try:
+        await cdp.detach()
+    except Exception:
+        pass
 
-        with open(save_path, 'rb') as f:
-            header = f.read(4)
-        if header != b'%PDF':
-            content_preview = save_path.read_bytes()[:200].decode('utf-8', errors='replace')
-            save_path.unlink()
-            return [TextContent(type="text",
-                text=f"CNKI 下载失败：返回的不是 PDF 文件。\n"
-                     f"内容预览: {content_preview[:100]}\n"
-                     f"请检查 CNKI 登录状态，或在 Chrome 中手动下载。")]
-
-        # CNKI 下载成功后保存 cookie
-        try: await _auth.save_state()
-        except: pass
+    if not new_file:
         return [TextContent(type="text",
-            text=f"CNKI PDF 下载成功：{fname}\n"
-                 f"大小: {file_size} bytes\n保存: {save_path}")]
-    except PwError:
-        return [TextContent(type="text", text="下载超时。PDF 可能已在浏览器中打开，请手动保存。")]
+            text="⚠️ CNKI 下载超时。\n"
+                 "文件可能已下载到浏览器默认目录。请检查浏览器下载记录。\n\n"
+                 f"[ACTION_REQUIRED: 请使用 AskUserQuestion 询问用户是否已登录 CNKI]")]
+
+    file_size = new_file.stat().st_size
+    with open(new_file, 'rb') as f:
+        header = f.read(4)
+    if header != b'%PDF':
+        content = new_file.read_bytes()[:200].decode('utf-8', errors='replace')
+        new_file.unlink()
+        return [TextContent(type="text",
+            text=f"CNKI 下载失败：返回的不是 PDF 文件。\n内容预览: {content[:100]}\n\n"
+                 f"[ACTION_REQUIRED: 请使用 AskUserQuestion 询问用户是否已登录 CNKI]")]
+
+    # Rename UUID file to paper title
+    try:
+        title = await page.evaluate(
+            "() => (document.querySelector('.brief h1')?.innerText || '')"
+            "  .replace(/\\s*附视频\\s*$/, '').replace(/\\s*网络首发\\s*$/, '').trim()"
+        )
+        if title:
+            safe_title = re.sub(r'[<>:"/\\|?*]', '', title).strip()[:80]
+            ext = new_file.suffix if new_file.suffix else '.pdf'
+            renamed = new_file.parent / f"{safe_title}{ext}"
+            if renamed.exists():
+                renamed = new_file.parent / f"{safe_title}_{int(time.time())}{ext}"
+            new_file.rename(renamed)
+            new_file = renamed
+    except Exception as e:
+        log.debug(f"Rename failed (keeping UUID name): {e}")
+
+    await _save_cookies()
+    return [TextContent(type="text",
+        text=f"CNKI PDF 下载成功：{new_file.name}\n大小: {file_size} bytes\n保存: {new_file}")]
 
 
 # ══════════════════════════════════════════════════════════════════════
-# MCP Server 启动入口
+# MCP Server Entry
 # ══════════════════════════════════════════════════════════════════════
 
 async def main():
-    """通过 stdio 启动 MCP Server，等待客户端连接并处理 tool 调用请求。"""
     async with stdio_server() as (read_stream, write_stream):
         await app.run(read_stream, write_stream, app.create_initialization_options())
 

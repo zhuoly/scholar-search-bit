@@ -52,6 +52,7 @@ CNKI 的反爬系统会检测 Playwright 浏览器（无论 headless 还是有�
 """
 
 import asyncio
+from datetime import datetime
 from .base import BaseAdapter
 
 
@@ -265,7 +266,7 @@ class CnkiAdapter(BaseAdapter):
         if year_start or year_end:
             try:
                 start = year_start or "1900"
-                end = year_end or "2026"
+                end = year_end or str(datetime.now().year)
                 date_input = await self.page.query_selector('input#txt_1_datestart')
                 if date_input:
                     await self.page.fill('input#txt_1_datestart', start)
