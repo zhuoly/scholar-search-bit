@@ -184,59 +184,75 @@ def _need_action_response(db: str, action: str) -> list[TextContent]:
 
 
 async def _try_cookie_session(db: str) -> bool:
-    """Try to restore session from saved cookies. Returns True on success."""
+    """Try to restore session from saved cookies. Returns True on success.
+
+    Reuses existing _auth connection if available — creating a new CarsiAuth
+    and calling stop() on failure would disconnect the shared Playwright session
+    and close all open pages across all databases.
+    """
     global _auth, _pages
-    old_auth = _auth
 
-    auth = CarsiAuth()
-    try:
-        await auth.start()
-    except RuntimeError:
-        return False
+    # Reuse existing connection if alive
+    if _auth and _auth.context:
+        try:
+            _ = _auth.context.pages
+        except Exception:
+            _auth = None
+            _pages = {}
 
-    ctx = auth.context
+    # Need to establish a new connection
+    if not _auth or not _auth.context:
+        new_auth = CarsiAuth()
+        try:
+            await new_auth.start()
+        except RuntimeError:
+            return False
+        _auth = new_auth
+        _pages = {}
+
+    ctx = _auth.context
     if not ctx:
-        await auth.stop()
         return False
 
     db_config = get_db(db)
     if not db_config:
-        await auth.stop()
         return False
 
     domain = db_config["home_url"].split("/")[2]
-    page = None
-    for p in ctx.pages:
-        if domain in p.url and "login" not in p.url.lower():
-            page = p
-            break
+    page = _pages.get(db)
+    if page:
+        try:
+            _ = page.url
+        except Exception:
+            page = None
+
     if not page:
-        page = await ctx.new_page()
-        await page.goto(db_config["home_url"], wait_until="domcontentloaded", timeout=30000)
+        for p in ctx.pages:
+            if domain in p.url and "login" not in p.url.lower():
+                page = p
+                break
+
+    if not page:
+        try:
+            page = await ctx.new_page()
+            await page.goto(db_config["home_url"], wait_until="domcontentloaded", timeout=30000)
+        except Exception as e:
+            log.debug(f"_try_cookie_session new_page failed: {e}")
+            return False
 
     url = page.url
     if any(kw in url.lower() for kw in ["login", "wayf", "cas", "authserver"]):
-        await auth.stop()
         return False
     if domain not in url:
-        await auth.stop()
         return False
 
     try:
         page_text = await page.evaluate("() => document.body.innerText.slice(0, 5000)")
         if not _is_logged_in(db, page_text):
-            await auth.stop()
             return False
     except Exception as e:
         log.debug(f"Login check error (ignored): {e}")
 
-    if old_auth and old_auth is not auth:
-        try:
-            await old_auth.stop()
-        except Exception as e:
-            log.debug(f"Old auth cleanup: {e}")
-
-    _auth = auth
     _pages[db] = page
     return True
 
