@@ -230,11 +230,16 @@ class CnkiAdapter(BaseAdapter):
         多条件用 AND 连接，例如: SU=MIMO雷达 AND AU=张三 AND LY=信号处理
         """
         # 构建专业检索查询字符串
+        # CNKI 专业检索支持在查询串中直接指定年份: YE BETWEEN ('2022','2025')
         parts = [f"SU={query}"]
         if author:
             parts.append(f"AU={author}")
         if journal:
             parts.append(f"LY={journal}")
+        if year_start or year_end:
+            start = year_start or "1900"
+            end = year_end or str(datetime.now().year)
+            parts.append(f"YE BETWEEN ('{start}','{end}')")
         pro_query = " AND ".join(parts)
 
         await self._navigate(self.pro_search_url)
@@ -257,20 +262,6 @@ class CnkiAdapter(BaseAdapter):
                 return {"success": False, "error": "professional search textarea not found"}
         except Exception as e:
             return {"success": False, "error": f"failed to fill search query: {e}"}
-
-        # 设置年份范围（如有）
-        if year_start or year_end:
-            try:
-                start = year_start or "1900"
-                end = year_end or str(datetime.now().year)
-                start_input = await self.page.query_selector('input[placeholder*="开始"], input.date-from, input[name*="start"]')
-                end_input = await self.page.query_selector('input[placeholder*="结束"], input.date-to, input[name*="end"]')
-                if start_input:
-                    await start_input.fill(start)
-                if end_input:
-                    await end_input.fill(end)
-            except Exception:
-                pass
 
         # 点击检索按钮
         try:

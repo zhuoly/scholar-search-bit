@@ -907,7 +907,15 @@ async def handle_cnki_search(args: dict) -> list[TextContent]:
     papers = result.get("papers", [])
     total = result.get("total", "?")
     page_info = result.get("page", "1/1")
-    text = f"CNKI 搜索 \"{args['query']}\"：共 {total} 条结果 (第 {page_info} 页)\n\n"
+
+    # 构建标题，显示实际使用的筛选条件
+    filters = []
+    if args.get("author"):    filters.append(f"作者={args['author']}")
+    if args.get("journal"):   filters.append(f"期刊={args['journal']}")
+    if args.get("year_start") or args.get("year_end"):
+        filters.append(f"年份={args.get('year_start','?')}-{args.get('year_end','?')}")
+    filter_str = f" [{', '.join(filters)}]" if filters else ""
+    text = f"CNKI 搜索 \"{args['query']}\"{filter_str}：共 {total} 条结果 (第 {page_info} 页)\n\n"
     for i, p in enumerate(papers):
         text += f"[{i+1}] **{p.get('title', '?')}**\n"
         if p.get("authors"): text += f"    作者: {p['authors']}\n"
