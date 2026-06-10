@@ -68,7 +68,7 @@ SORT_MAP = {
 class CnkiAdapter(BaseAdapter):
     name = "cnki"
     home_url = "https://kns.cnki.net/kns8s/search"
-    adv_url = "https://kns.cnki.net/kns/AdvSearch?classid=7NS01R8M"
+    pro_search_url = "https://kns.cnki.net/kns8s/AdvSearch?type=expert&classid=WD0FTY92&rlang=CHINESE"
 
     # ── 登录 ──────────────────────────────────────────────────────
     # CNKI 登录流程: kns.cnki.net → 机构登录 → 校外访问 → fsso.cnki.net → CARSI IdP
@@ -183,7 +183,7 @@ class CnkiAdapter(BaseAdapter):
             return await self._advanced_search(
                 query, author=author, journal=journal,
                 year_start=year_start, year_end=year_end,
-                sort=sort,
+                sort=sort, page_num=page_num,
             )
 
         await self._navigate(self.home_url)
@@ -222,61 +222,67 @@ class CnkiAdapter(BaseAdapter):
         return await self._extract_results()
 
     async def _advanced_search(self, query, author=None, journal=None,
-                               year_start=None, year_end=None, sort=None) -> dict:
-        """高级搜索 — 使用 CNKI 的旧版 AdvSearch 界面。
+                               year_start=None, year_end=None, sort=None,
+                               page_num=1) -> dict:
+        """专业检索 — 使用 CNKI 专业检索页面的文本查询语法。
 
-        旧版界面有固定的 input#txt_1_value1 等选择器，比新版更稳定。
-        字段代码: SU=主题, AU=作者, LY=来源, TI=篇名, KY=关键词
+        字段代码: SU=主题, AU=作者, LY=文献来源, KY=关键词, TI=篇名
+        多条件用 AND 连接，例如: SU=MIMO雷达 AND AU=张三 AND LY=信号处理
         """
-        await self._navigate(self.adv_url)
+        # 构建专业检索查询字符串
+        parts = [f"SU={query}"]
+        if author:
+            parts.append(f"AU={author}")
+        if journal:
+            parts.append(f"LY={journal}")
+        pro_query = " AND ".join(parts)
+
+        await self._navigate(self.pro_search_url)
 
         try:
-            await self.page.wait_for_selector('input#txt_1_value1', timeout=30000)
+            await self.page.wait_for_selector('textarea.search-input, #expert-search-input, textarea', timeout=30000)
         except Exception:
-            return {"success": False, "error": "timeout loading advanced search page"}
+            return {"success": False, "error": "timeout loading professional search page"}
 
         if await self._check_captcha():
             return {"success": False, "error": "captcha"}
 
-        await self.page.fill('input#txt_1_value1', query)
+        # 找到专业检索输入框并填入查询
+        try:
+            textarea = await self.page.query_selector('textarea.search-input, #expert-search-input, textarea')
+            if textarea:
+                await textarea.click()
+                await textarea.fill(pro_query)
+            else:
+                return {"success": False, "error": "professional search textarea not found"}
+        except Exception as e:
+            return {"success": False, "error": f"failed to fill search query: {e}"}
 
-        if author:
-            try:
-                sel = await self.page.query_selector('select#txt_1_special1')
-                if sel:
-                    await sel.select_option(value='AU')
-                await self.page.fill('input#txt_1_value1', author)
-                sel2 = await self.page.query_selector('select#txt_2_special1')
-                if sel2:
-                    await sel2.select_option(value='SU')
-                await self.page.fill('input#txt_2_value1', query)
-                await self.page.fill('input#txt_1_value1', author)
-            except Exception:
-                pass
-
-        if journal:
-            try:
-                sel = await self.page.query_selector('select#txt_2_special1')
-                if sel:
-                    await sel.select_option(value='LY')
-                await self.page.fill('input#txt_2_value1', journal)
-            except Exception:
-                pass
-
+        # 设置年份范围（如有）
         if year_start or year_end:
             try:
                 start = year_start or "1900"
                 end = year_end or str(datetime.now().year)
-                date_input = await self.page.query_selector('input#txt_1_datestart')
-                if date_input:
-                    await self.page.fill('input#txt_1_datestart', start)
-                    await self.page.fill('input#txt_1_dateend', end)
+                start_input = await self.page.query_selector('input[placeholder*="开始"], input.date-from, input[name*="start"]')
+                end_input = await self.page.query_selector('input[placeholder*="结束"], input.date-to, input[name*="end"]')
+                if start_input:
+                    await start_input.fill(start)
+                if end_input:
+                    await end_input.fill(end)
             except Exception:
                 pass
 
-        await self.page.click('input.btn-search')
-        await asyncio.sleep(2)
+        # 点击检索按钮
+        try:
+            btn = await self.page.query_selector('input.search-btn, button.search-btn, input[value="检索"], button:has-text("检索")')
+            if btn:
+                await btn.click()
+            else:
+                await self.page.keyboard.press('Enter')
+        except Exception as e:
+            return {"success": False, "error": f"failed to click search: {e}"}
 
+        # 等待结果
         try:
             await self.page.wait_for_function(
                 "document.body.innerText.includes('条结果') || document.body.innerText.includes('找到')",
@@ -292,6 +298,9 @@ class CnkiAdapter(BaseAdapter):
 
         if sort and sort in SORT_MAP:
             await self._apply_sort(SORT_MAP[sort])
+
+        if page_num > 1:
+            await self._go_to_page(page_num)
 
         return await self._extract_results()
 

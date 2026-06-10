@@ -421,15 +421,21 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="cnki_search",
-            description="Search CNKI (中国知网) for papers. Supports advanced filters. Auto-connects Chrome if needed.",
+            description=(
+                "Search CNKI (中国知网) for papers. "
+                "For basic search, only 'query' is needed. "
+                "Optional filters (author, journal, year_start, year_end) trigger professional search (专业检索) "
+                "using CNKI query syntax: SU=topic AND AU=author AND LY=journal. "
+                "Do NOT use author:/journal:/year: syntax — those are not supported by CNKI."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search keywords (Chinese or English)"},
-                    "author": {"type": "string", "description": "Filter by author name"},
-                    "journal": {"type": "string", "description": "Filter by journal/source name"},
-                    "year_start": {"type": "string", "description": "Start year (e.g. '2020')"},
-                    "year_end": {"type": "string", "description": "End year (e.g. '2025')"},
+                    "query": {"type": "string", "description": "Search keywords (Chinese or English). Required."},
+                    "author": {"type": "string", "description": "(Optional) Filter by author name"},
+                    "journal": {"type": "string", "description": "(Optional) Filter by journal/source name"},
+                    "year_start": {"type": "string", "description": "(Optional) Start year e.g. '2020'"},
+                    "year_end": {"type": "string", "description": "(Optional) End year e.g. '2025'"},
                     "page": {"type": "integer", "description": "Page number (default 1)", "default": 1},
                     "sort": {"type": "string", "description": "Sort: relevance, date, citations, downloads"},
                 },
