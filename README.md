@@ -120,6 +120,9 @@ scholar-search/
 - [cnki-skills](https://github.com/cookjohn/cnki-skills) — CNKI 知网 Skills
 - [cnki-codex-skills](https://github.com/cfh-7598/cnki-codex-skills) — CDP 连接模式参考
 
+## Links
+**[Linux DO](https://linux.do/)**
+
 ## License
 
 MIT
