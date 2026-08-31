@@ -54,6 +54,7 @@ CNKI 的反爬系统会检测 Playwright 浏览器（无论 headless 还是有�
 import asyncio
 from datetime import datetime
 from .base import BaseAdapter
+from .. import school
 
 
 # CNKI 搜索结果页的排序按钮 ID 映射
@@ -120,30 +121,31 @@ class CnkiAdapter(BaseAdapter):
         # fsso.cnki.net: 搜索学校并选择
         # 注意: 必须触发 keyup 事件才能激活自动补全，fill() 不够
         if "fsso" in self.page.url or "cnki.net" in self.page.url:
-            await self.page.evaluate("""() => {
+            await self.page.evaluate("""(name) => {
                 const input = document.querySelector('input#o');
                 if (input) {
-                    input.value = "西安电子科技大学";
-                    input.dispatchEvent(new KeyboardEvent('keyup', {key: '学', keyCode: 88, bubbles: true}));
+                    input.value = name;
+                    input.dispatchEvent(new KeyboardEvent('keyup', {
+                        key: name.slice(-1), keyCode: 88, bubbles: true}));
                 }
-            }""")
+            }""", school.SCHOOL_NAME)
             await asyncio.sleep(2)
-            await self.page.evaluate("""() => {
+            await self.page.evaluate("""(name) => {
                 const items = document.querySelectorAll('.auto_show div');
                 for (const el of items) {
-                    if (el.textContent?.includes('西安电子科技大学')) { el.click(); return; }
+                    if (el.textContent?.includes(name)) { el.click(); return; }
                 }
-            }""")
+            }""", school.SCHOOL_NAME)
             await asyncio.sleep(3)
 
         # CARSI IdP 认证
-        if "idp.xidian.edu.cn" in self.page.url and carsi_auth:
+        if school.SCHOOL_IDP_HOST in self.page.url and carsi_auth:
             await carsi_auth._handle_cas_login(self.page, username, password)
             await asyncio.sleep(1)
 
         # 处理同意条款页面（可能有多轮）
         for _ in range(5):
-            if "idp.xidian.edu.cn" not in self.page.url:
+            if school.SCHOOL_IDP_HOST not in self.page.url:
                 break
             await self.page.evaluate("""() => {
                 document.querySelectorAll('input[type="checkbox"]').forEach(cb => {

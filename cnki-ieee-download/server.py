@@ -29,8 +29,9 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from carsi_search.engine import CarsiAuth, log
-from carsi_search.registry import list_dbs, get_db, get_adapter
+from carsi_search.registry import list_dbs, get_db, get_adapter, get_sp_url
 from carsi_search.databases.cnki import CnkiAdapter
+from carsi_search import school
 
 from playwright.async_api import Page as PwPage
 
@@ -142,25 +143,27 @@ def _need_login_response(db: str) -> list[TextContent]:
     db_config = get_db(db)
     label = db_config["label"] if db_config else db
     home = db_config["home_url"] if db_config else ""
+    sp = get_sp_url(db)  # 已填好本校 entityId 的机构登录直达链接
 
     guides = {
         "cnki": (
             "1. 打开已启动的 Chrome/Edge 浏览器\n"
             "2. 访问 https://kns.cnki.net\n"
             "3. 点击「机构登录」→「校外访问」\n"
-            "4. 选择学校并完成认证"
+            f"4. 选择「{school.SCHOOL_NAME}」并完成认证"
         ),
         "sciencedirect": (
             "1. 打开已启动的 Chrome/Edge 浏览器\n"
-            "2. 访问 https://www.sciencedirect.com\n"
-            "3. 点击 Sign in → Sign in via your institution\n"
-            "4. 完成机构认证"
+            + (f"2. 直接打开机构登录链接：{sp}\n" if sp else
+               "2. 访问 https://www.sciencedirect.com 并点击 Sign in → Sign in via your institution\n")
+            + f"3. 用{school.SCHOOL_NAME}统一身份认证账号登录"
         ),
         "ieee": (
             "1. 打开已启动的 Chrome/Edge 浏览器\n"
-            f"2. 访问 {home}\n"
-            "3. 点击 Institutional Sign In\n"
-            "4. 完成机构认证"
+            + (f"2. 直接打开机构登录链接（已含本校 entityId）：\n   {sp}\n" if sp else
+               f"2. 访问 {home}，点击 Institutional Sign In\n")
+            + f"3. 用{school.SCHOOL_NAME}统一身份认证账号登录\n"
+            + "4. 登录成功后页面顶部会显示 Access provided by: ..."
         ),
     }
     steps = guides.get(db, guides["ieee"])

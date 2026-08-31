@@ -1,5 +1,13 @@
 # Scholar Search — 学术论文搜索下载 MCP
 
+> **本仓库是 [zhdzh12138/scholar-search](https://github.com/zhdzh12138/scholar-search) 的 fork。** 相对上游做了三处改动：
+>
+> 1. **修复依赖漂移（与学校无关的真 bug）** — 上游 `requirements.txt` 写的是 `mcp>=1.0.0`，现在会解析到 mcp 2.x；而 2.x 移除了 `@app.list_tools()` / `@app.call_tool()` 装饰器 API，`server.py` 基于 1.x 低层 `Server` 编写，直接 `AttributeError: 'Server' object has no attribute 'list_tools'` 起不来。已锁定 `mcp>=1.9,<2`。
+> 2. **学校配置解耦** — 原先硬编码在 `databases/cnki.py` 里的学校名与 IdP 域名抽到了新文件 `carsi_search/school.py`，支持环境变量覆盖。默认值从西安电子科技大学改为**北京理工大学**，换学校只改这一个文件（见「适配学校」一节）。
+> 3. **让 `sp_url` 真正生效** — 上游 `registry.py` 中 `sp_url` 的 `{entity_id_raw}` 占位符没有任何代码填充，属于死代码。新增 `get_sp_url()` 填入本校 entityId，未登录时直接给出机构登录直达链接。
+>
+> IEEE 的搜索 / 详情 / PDF 下载已在北京理工大学账号下端到端实测通过；CNKI 与 ScienceDirect 的配置已就位但未实测。
+
 通过 **CDP 连接用户真实 Chrome/Edge**，一站式搜索和下载 IEEE / ScienceDirect / CNKI 论文。
 
 无需自动化登录 — 用户手动登录一次，cookie 自动保存恢复。
@@ -18,8 +26,8 @@ CDP 连接 (carsi_search/engine.py)      ← cookie 保存/恢复
 ## 安装
 
 ```bash
-git clone https://github.com/zhdzh12138/scholar-search.git
-cd scholar-search
+git clone https://github.com/zhuoly/scholar-search-bit.git
+cd scholar-search-bit
 pip install -r cnki-ieee-download/requirements.txt
 python -m playwright install chromium
 ```
@@ -110,14 +118,43 @@ scholar-search/
 | Playwright + mcp | 是 | MCP 服务器运行时 |
 | 机构账号 | 下载需要 | IEEE/ScienceDirect CARSI 认证；CNKI 机构登录 |
 
+## 适配学校（本地修改）
+
+学校相关配置已从代码里抽到 `carsi_search/school.py`，当前默认值为**北京理工大学**：
+
+| 配置 | 默认值 | 用途 | 环境变量覆盖 |
+|------|--------|------|--------------|
+| `SCHOOL_NAME` | `北京理工大学` | CNKI「校外访问」机构列表里选的学校名 | `CARSI_SCHOOL_NAME` |
+| `SCHOOL_IDP_HOST` | `idp.bit.edu.cn` | 判断是否已跳到本校 Shibboleth 认证页 | `CARSI_IDP_HOST` |
+| `IEEE_ENTITY_ID` | `https://idp.bit.edu.cn/idp/shibboleth` | IEEE 机构登录 entityId | `CARSI_IEEE_ENTITY_ID` |
+| `SD_ENTITY_ID` | 同上 | ScienceDirect 机构登录 entityId | `CARSI_SD_ENTITY_ID` |
+
+换成别的学校时，用 IEEE 官方接口查本校 entityId（浏览器直接打开）：
+
+```
+https://ieeexplore.ieee.org/rest/api/auth/wayf-by-displayname?keyword=Beijing%20Institute%20of%20Technology&url=/Xplore/home.jsp
+```
+
+返回形如：
+
+```json
+[{"name":"Beijing Institute of Technology","entityId":"https://idp.bit.edu.cn/idp/shibboleth",
+  "url":"/servlet/wayf.jsp?entityId=https://idp.bit.edu.cn/idp/shibboleth&url=..."}]
+```
+
+未登录时 `ieee_login` 会直接给出拼好 entityId 的机构登录直达链接，点开走完本校统一身份认证即可。
+
 ## 免责声明
 
-- 本项目仅在**西安电子科技大学**账号下测试通过，其他学校的 CARSI 认证流程、域名、IdP 配置可能不同，需要对 `carsi_search/registry.py` 中的 `sp_url`、`home_url`、`target_url_pattern` 等字段进行修改。
+- 原作者在**西安电子科技大学**账号下调试；本副本已适配**北京理工大学**（Shibboleth/CARSI，`idp.bit.edu.cn`），IEEE 搜索/详情/下载实测通过。
+- 依赖 `mcp` 锁在 `1.x`：`mcp` 2.x 移除了 `@app.list_tools()` / `@app.call_tool()` 装饰器 API，`server.py` 用的是 1.x 低层 `Server`。
+- 其他学校若走 WebVPN 反向代理（域名被改写成 `xxx.webvpn.school.edu.cn`），本项目里硬编码的 `ieeexplore.ieee.org` 地址不适用，需要改 `registry.py` / 适配器里的域名。
 - 本项目仅供学术研究使用，请遵守各数据库的使用条款。
 - Cookie 文件（`.carsi_state.json`）包含登录凭证，请勿提交到公开仓库。
 
 ## 致谢
 
+- [zhdzh12138/scholar-search](https://github.com/zhdzh12138/scholar-search) — 本仓库的上游项目，CDP + CARSI 整体架构出自该项目
 - [cnki-skills](https://github.com/cookjohn/cnki-skills) — CNKI 知网 Skills
 - [cnki-codex-skills](https://github.com/cfh-7598/cnki-codex-skills) — CDP 连接模式参考
 

@@ -1,2 +1,4 @@
-mcp>=1.0.0
+# mcp 2.x 移除了 @app.list_tools() / @app.call_tool() 装饰器 API（改为构造函数传 handler），
+# server.py 基于 1.x 低层 Server 装饰器编写，因此锁定在 1.x。
+mcp>=1.9,<2
 playwright>=1.48.0
